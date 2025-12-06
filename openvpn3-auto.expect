@@ -8,6 +8,253 @@
 
 set timeout -1
 
+# --- Dependency Checking --------------------------------------------------
+proc detect_distro {} {
+    # Try to detect the Linux distribution
+    # First check /etc/os-release
+    if {[file exists /etc/os-release]} {
+        if {![catch {set fh [open /etc/os-release r]}]} {
+            set content [read $fh]
+            close $fh
+            
+            # Check for common distros
+            if {[regexp -nocase {ID=arch|ID_LIKE=.*arch} $content]} {
+                return "arch"
+            } elseif {[regexp -nocase {ID=manjaro} $content]} {
+                return "arch"
+            } elseif {[regexp -nocase {ID=debian|ID_LIKE=.*debian} $content]} {
+                return "debian"
+            } elseif {[regexp -nocase {ID=ubuntu} $content]} {
+                return "debian"
+            } elseif {[regexp -nocase {ID=fedora|ID_LIKE=.*fedora} $content]} {
+                return "fedora"
+            } elseif {[regexp -nocase {ID=rhel|ID=centos|ID_LIKE=.*rhel} $content]} {
+                return "rhel"
+            } elseif {[regexp -nocase {ID=opensuse|ID_LIKE=.*suse} $content]} {
+                return "suse"
+            }
+        }
+    }
+    
+    # Try /usr/lib/os-release as fallback (for containers/flatpak)
+    if {[file exists /usr/lib/os-release]} {
+        if {![catch {set fh [open /usr/lib/os-release r]}]} {
+            set content [read $fh]
+            close $fh
+            
+            if {[regexp -nocase {ID=arch|ID_LIKE=.*arch} $content]} {
+                return "arch"
+            } elseif {[regexp -nocase {ID=manjaro} $content]} {
+                return "arch"
+            } elseif {[regexp -nocase {ID=debian|ID_LIKE=.*debian} $content]} {
+                return "debian"
+            } elseif {[regexp -nocase {ID=ubuntu} $content]} {
+                return "debian"
+            } elseif {[regexp -nocase {ID=fedora|ID_LIKE=.*fedora} $content]} {
+                return "fedora"
+            }
+        }
+    }
+    
+    # Try detecting via package managers as last resort
+    if {[auto_execok pacman] ne ""} {
+        return "arch"
+    } elseif {[auto_execok apt] ne ""} {
+        return "debian"
+    } elseif {[auto_execok dnf] ne ""} {
+        return "fedora"
+    } elseif {[auto_execok yum] ne ""} {
+        return "rhel"
+    } elseif {[auto_execok zypper] ne ""} {
+        return "suse"
+    }
+    
+    return "unknown"
+}
+
+proc get_install_command {distro pkg} {
+    # Map package names per distro and return install command
+    set pkg_map [dict create \
+        expect [dict create \
+            arch "expect" \
+            debian "expect" \
+            fedora "expect" \
+            rhel "expect" \
+            suse "expect" \
+            unknown "expect" \
+        ] \
+        zenity [dict create \
+            arch "zenity" \
+            debian "zenity" \
+            fedora "zenity" \
+            rhel "zenity" \
+            suse "zenity" \
+            unknown "zenity" \
+        ] \
+        openvpn3 [dict create \
+            arch "openvpn3 (AUR)" \
+            debian "openvpn3" \
+            fedora "openvpn3-client" \
+            rhel "openvpn3-client" \
+            suse "openvpn3" \
+            unknown "openvpn3" \
+        ] \
+    ]
+    
+    set install_cmd [dict create \
+        arch "paru -S" \
+        debian "sudo apt install" \
+        fedora "sudo dnf install" \
+        rhel "sudo yum install" \
+        suse "sudo zypper install" \
+        unknown "# Install using your package manager:" \
+    ]
+    
+    set pkg_name $pkg
+    if {[dict exists $pkg_map $pkg]} {
+        set distro_map [dict get $pkg_map $pkg]
+        if {[dict exists $distro_map $distro]} {
+            set pkg_name [dict get $distro_map $distro]
+        }
+    }
+    
+    set cmd "# Install $pkg"
+    if {[dict exists $install_cmd $distro]} {
+        set cmd "[dict get $install_cmd $distro] $pkg_name"
+    }
+    
+    return $cmd
+}
+
+proc check_command_exists {cmd} {
+    return [expr {[auto_execok $cmd] ne ""}]
+}
+
+proc check_dependencies {} {
+    set missing_required {}
+    set missing_optional {}
+    set distro [detect_distro]
+    
+    # Check required dependencies
+    # Note: We're running inside expect, so expect itself is available
+    
+    # Check openvpn3
+    if {![check_command_exists "openvpn3"]} {
+        lappend missing_required [list "openvpn3" [get_install_command $distro "openvpn3"] "OpenVPN 3 Linux client - required for VPN connections"]
+    }
+    
+    # Check optional dependencies
+    # Zenity is optional (terminal fallback exists)
+    if {![check_command_exists "zenity"]} {
+        lappend missing_optional [list "zenity" [get_install_command $distro "zenity"] "GUI dialogs - optional, terminal fallback available"]
+    }
+    
+    return [list $missing_required $missing_optional $distro]
+}
+
+proc print_dependency_status {} {
+    lassign [check_dependencies] missing_required missing_optional distro
+    
+    puts ""
+    puts "╔══════════════════════════════════════════════════════════════════╗"
+    puts "║           OpenVPN 3 Automation Helper - Dependency Check         ║"
+    puts "╚══════════════════════════════════════════════════════════════════╝"
+    puts ""
+    
+    # Show detected distro
+    set distro_display $distro
+    if {$distro eq "arch"} { set distro_display "Arch Linux / Manjaro" }
+    if {$distro eq "debian"} { set distro_display "Debian / Ubuntu" }
+    if {$distro eq "fedora"} { set distro_display "Fedora" }
+    if {$distro eq "rhel"} { set distro_display "RHEL / CentOS" }
+    if {$distro eq "suse"} { set distro_display "openSUSE" }
+    if {$distro eq "unknown"} { set distro_display "Unknown (please adapt commands)" }
+    puts "Detected Distribution: $distro_display"
+    puts ""
+    
+    # Check what's installed
+    puts "Checking dependencies..."
+    puts ""
+    
+    # Always show expect as OK since we're running
+    puts "  ✓ expect          - Installed (you're running this script!)"
+    
+    if {[check_command_exists "openvpn3"]} {
+        puts "  ✓ openvpn3        - Installed"
+    } else {
+        puts "  ✗ openvpn3        - NOT INSTALLED (required)"
+    }
+    
+    if {[check_command_exists "zenity"]} {
+        puts "  ✓ zenity          - Installed"
+    } else {
+        puts "  ○ zenity          - Not installed (optional, for GUI dialogs)"
+    }
+    puts ""
+    
+    if {[llength $missing_required] > 0} {
+        puts "════════════════════════════════════════════════════════════════════"
+        puts "ERROR: Missing required dependencies!"
+        puts "════════════════════════════════════════════════════════════════════"
+        puts ""
+        puts "Please install the following required packages:"
+        puts ""
+        foreach dep $missing_required {
+            lassign $dep name cmd desc
+            puts "  $name - $desc"
+            puts "    $cmd"
+            puts ""
+        }
+        
+        # Special instructions for openvpn3 on different distros
+        if {$distro eq "arch"} {
+            puts "Note for Arch Linux:"
+            puts "  openvpn3 is available in the AUR. Install with:"
+            puts "    paru -S openvpn3"
+            puts "  or"
+            puts "    yay -S openvpn3"
+            puts ""
+        } elseif {$distro eq "debian"} {
+            puts "Note for Debian/Ubuntu:"
+            puts "  You may need to add the OpenVPN 3 repository first:"
+            puts "    https://openvpn.net/cloud-docs/openvpn3-client-for-linux/"
+            puts ""
+        }
+        
+        if {[llength $missing_optional] > 0} {
+            puts "Optional packages (for better experience):"
+            puts ""
+            foreach dep $missing_optional {
+                lassign $dep name cmd desc
+                puts "  $name - $desc"
+                puts "    $cmd"
+                puts ""
+            }
+        }
+        
+        return 0
+    }
+    
+    if {[llength $missing_optional] > 0} {
+        puts "════════════════════════════════════════════════════════════════════"
+        puts "Optional packages not installed:"
+        puts "════════════════════════════════════════════════════════════════════"
+        puts ""
+        foreach dep $missing_optional {
+            lassign $dep name cmd desc
+            puts "  $name - $desc"
+            puts "    $cmd"
+            puts ""
+        }
+        puts "The script will work but with reduced functionality."
+        puts ""
+    }
+    
+    puts "All required dependencies are installed! ✓"
+    puts ""
+    return 1
+}
+
 # --- Helper procedures ----------------------------------------------------
 proc log {level message} {
     set ts [timestamp -format "%Y-%m-%dT%H:%M:%S"]
@@ -137,18 +384,687 @@ proc check_config_exists {config_name} {
     return 0
 }
 
-proc show_status_dialog {title message {disconnect_info {}}} {
+proc get_available_configs {} {
+    # Get list of all imported OpenVPN configurations
+    if {[catch {set output [exec openvpn3 configs-list]} err]} {
+        return {}
+    }
+    
+    set configs {}
+    foreach line [split $output "\n"] {
+        set trimmed [string trim $line]
+        if {$trimmed eq "" || [string match "Configuration Name*" $trimmed] || [string match "---*" $trimmed]} {
+            continue
+        }
+        # The first word should be the config name
+        set name [lindex [split $trimmed] 0]
+        if {$name ne ""} {
+            lappend configs $name
+        }
+    }
+    return $configs
+}
+
+proc get_session_status {config_name} {
+    # Check if a config has an active session
+    set session_info [check_existing_session $config_name]
+    if {[dict get $session_info active]} {
+        return "Connected"
+    }
+    return "Disconnected"
+}
+
+proc build_profile_status_items {configs} {
+    # Build alternating list of profile names and status labels for zenity lists
+    set list_items {}
+    foreach config $configs {
+        set status [get_session_status $config]
+        lappend list_items $config $status
+    }
+    return $list_items
+}
+
+proc prompt_delete_profile_gui {configs} {
+    # Shared delete dialog for single profile selection with confirmation
+    set zenity_path [get_zenity]
+    if {$zenity_path eq ""} {
+        return [dict create selected "" action "refresh"]
+    }
+
+    if {[llength $configs] == 0} {
+        catch {exec $zenity_path --warning \
+            --title "No Profiles" \
+            --text "There are no profiles to delete." \
+            --width 350}
+        return [dict create selected "" action "refresh"]
+    }
+
+    set delete_list_items [list]
+    foreach config $configs {
+        set status [get_session_status $config]
+        set status_label "Not Connected"
+        if {$status eq "Connected"} {
+            set status_label "Connected"
+        }
+        lappend delete_list_items FALSE $config $status_label
+    }
+
+    set delete_cmd [list $zenity_path --list \
+        --title "Delete Profile" \
+        --text "Select a profile to delete:" \
+        --radiolist \
+        --print-column=2 \
+        --column "Select" \
+        --column "Profile Name" \
+        --column "Status" \
+        --width 500 \
+        --height 350 \
+        --ok-label "Delete" \
+        --cancel-label "Cancel" \
+        {*}$delete_list_items]
+
+    set delete_result [catch {exec {*}$delete_cmd} selected_profile]
+    set selected_profile [string trim $selected_profile]
+    log DEBUG "Delete dialog result=$delete_result, selected_profile='$selected_profile'"
+
+    if {$delete_result != 0 || $selected_profile eq ""} {
+        return [dict create selected "" action "refresh"]
+    }
+
+    set confirm_cmd [list $zenity_path --question \
+        --title "Delete Profile" \
+        --text "Delete '$selected_profile'?\n\nWARNING: This action cannot be undone.\n\nThe profile and all its settings will be permanently removed." \
+        --icon=dialog-warning \
+        --ok-label "Yes, Delete" \
+        --cancel-label "Cancel" \
+        --default-cancel \
+        --width 420]
+
+    set confirm_result [catch {exec {*}$confirm_cmd} confirm_err]
+    set confirm_exit_code 0
+    if {$confirm_result != 0 && [info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS"} {
+        set confirm_exit_code [lindex $::errorCode 2]
+    }
+    if {$confirm_result != 0 && $confirm_exit_code == 0} {
+        log WARN "Zenity confirmation returned stderr but exit_code=0: $confirm_err"
+        set confirm_result 0
+    }
+    log DEBUG "Confirmation result=$confirm_result exit_code=$confirm_exit_code err='$confirm_err'"
+
+    if {$confirm_result == 0} {
+        return [dict create selected $selected_profile action "delete_profile"]
+    }
+
+    return [dict create selected "" action "refresh"]
+}
+
+proc delete_profile {config_name} {
+    # Delete an OpenVPN configuration profile
+    if {$config_name eq ""} {
+        return 0
+    }
+    
+    # First check if there's an active session
+    set session_info [check_existing_session $config_name]
+    if {[dict get $session_info active]} {
+        # Disconnect first
+        if {[dict exists $session_info path]} {
+            log INFO "Disconnecting active session for '$config_name'..."
+            if {[catch {exec openvpn3 session-manage --session-path [dict get $session_info path] --disconnect} err]} {
+                log WARN "Failed to disconnect session: $err"
+            }
+            # Wait a moment for disconnect
+            after 1000
+        }
+    }
+    
+    # Now remove the config
+    log INFO "Removing configuration '$config_name'..."
+    log DEBUG "Executing: openvpn3 config-remove --config '$config_name' --force"
+    if {[catch {exec openvpn3 config-remove --config $config_name --force} err]} {
+        log ERROR "Failed to remove configuration: $err"
+        return 0
+    }
+    
+    log INFO "Configuration '$config_name' removed successfully!"
+    return 1
+}
+
+proc show_delete_dialog {} {
+    # Show dialog to select profile(s) to delete
+    set configs [get_available_configs]
+    
+    if {[llength $configs] == 0} {
+        set zenity_path [get_zenity]
+        if {$zenity_path ne ""} {
+            catch {exec $zenity_path --info --title "No Profiles" --text "No VPN profiles are available.\n\nImport a profile first using the 'Import New' button." --width 380}
+        } else {
+            puts "No VPN profiles available to delete."
+        }
+        return {}
+    }
+    
+    set zenity_path [get_zenity]
+    
+    if {$zenity_path ne ""} {
+        # Build the list with status for each config
+        set list_items {}
+        foreach config $configs {
+            set status [get_session_status $config]
+            lappend list_items $config $status
+        }
+        
+        # Use zenity list dialog with checkboxes for multi-select
+        set zenity_cmd [list $zenity_path --list \
+            --title "Delete VPN Profiles" \
+            --text "Select profile(s) to delete.\n\nThis action cannot be undone." \
+            --column "Profile Name" \
+            --column "Status" \
+            --width 500 \
+            --height 380 \
+            --ok-label "Delete Selected" \
+            --cancel-label "Cancel" \
+            {*}$list_items]
+        
+        set result [catch {exec {*}$zenity_cmd} response]
+        set response [string trim $response]
+        
+        if {$result == 0 && $response ne ""} {
+            # Confirm deletion
+            set confirm_cmd [list $zenity_path --question \
+                --title "Confirm Deletion" \
+                --text "Confirm delete\n\nAre you sure you want to delete:\n\n$response\n\nThis action cannot be undone." \
+                --ok-label "Yes, Delete" \
+                --cancel-label "Cancel" \
+                --default-cancel \
+                --width 400]
+            
+            # Capture zenity exit code for visibility (0 = Yes/Delete, 1 = Cancel/Close)
+            set confirm_result [catch {exec {*}$confirm_cmd} confirm_err]
+            set confirm_exit_code 0
+            if {$confirm_result != 0 && [info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS"} {
+                set confirm_exit_code [lindex $::errorCode 2]
+            }
+            # If zenity exits 0 but writes to stderr, exec returns error; treat that as success
+            if {$confirm_result != 0 && $confirm_exit_code == 0} {
+                log WARN "Zenity confirmation returned stderr but exit_code=0: $confirm_err"
+                set confirm_result 0
+            }
+            log DEBUG "Delete confirm exit_code=$confirm_exit_code result=$confirm_result err='$confirm_err'"
+            if {$confirm_result == 0} {
+                return [list $response]
+            }
+        }
+        return {}
+    }
+    
+    # Terminal fallback
+    puts ""
+    puts "╔══════════════════════════════════════════════════════════════════╗"
+    puts "║           Delete VPN Profile                                     ║"
+    puts "╚══════════════════════════════════════════════════════════════════╝"
+    puts ""
+    puts "  #   Profile Name                          Status"
+    puts "  ─── ────────────────────────────────────  ────────────"
+    
+    set idx 1
+    foreach config $configs {
+        set status [get_session_status $config]
+        set status_indicator "○"
+        if {$status eq "Connected"} {
+            set status_indicator "●"
+        }
+        puts [format "  %-3d %-40s %s %s" $idx $config $status_indicator $status]
+        incr idx
+    }
+    
+    puts ""
+    puts "Enter profile number to delete (or 'q' to cancel):"
+    send_user "> "
+    flush stdout
+    expect_user -re "(.+)\n"
+    set choice [string trim $expect_out(1,string)]
+    
+    if {$choice eq "q" || $choice eq "Q"} {
+        return {}
+    }
+    
+    if {[string is integer -strict $choice] && $choice >= 1 && $choice <= [llength $configs]} {
+        set selected_config [lindex $configs [expr {$choice - 1}]]
+        
+        # Confirm deletion
+        puts ""
+        puts "Are you sure you want to delete '$selected_config'? (y/n)"
+        send_user "> "
+        flush stdout
+        expect_user -re "(.+)\n"
+        set confirm [string tolower [string trim $expect_out(1,string)]]
+        
+        if {$confirm eq "y" || $confirm eq "yes"} {
+            return [list $selected_config]
+        }
+    }
+    
+    return {}
+}
+
+proc show_profile_selector {} {
+    # Show a GUI dialog to select from available VPN profiles
+    set configs [get_available_configs]
+    
+    if {[llength $configs] == 0} {
+        return [dict create selected "" action "import"]
+    }
+
+    set zenity_path [get_zenity]
+    
+    if {$zenity_path ne ""} {
+        set list_items [build_profile_status_items $configs]
+
+        # Use zenity list dialog - double-click to connect, buttons for other actions
+        set zenity_cmd [list $zenity_path --list \
+            --title "OpenVPN 3 - Profile Manager" \
+            --text "VPN Profiles\n\nDouble-click a profile to connect:" \
+            --column "Profile Name" \
+            --column "Status" \
+            --width 550 \
+            --height 420 \
+            --ok-label "Refresh" \
+            --cancel-label "Exit" \
+            --extra-button "Import New" \
+            --extra-button "Delete" \
+            {*}$list_items]
+        
+        set result [catch {exec {*}$zenity_cmd} response]
+        
+        # Get actual exit code from errorCode
+        set exit_code 0
+        if {$result != 0} {
+            if {[info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS"} {
+                set exit_code [lindex $::errorCode 2]
+            } else {
+                set exit_code 1
+            }
+        }
+        
+        set response [string trim $response]
+        
+        # Debug: log what we received
+        log DEBUG "Zenity result=$result, exit_code=$exit_code, response='$response'"
+        
+        # Handle extra buttons / exit (exit_code 1)
+        if {$exit_code == 1} {
+            if {[string match "*Import New*" $response]} {
+                log DEBUG "Import button detected"
+                return [dict create selected "" action "import"]
+            }
+            if {[string match "*Delete*" $response]} {
+                log DEBUG "Delete button detected"
+                return [prompt_delete_profile_gui $configs]
+            }
+            log DEBUG "Exit/close detected"
+            return [dict create selected "" action "cancel"]
+        }
+        
+        # OK button (unused) or double-click on item
+        if {$exit_code == 0} {
+            if {$response ne ""} {
+                # Profile was double-clicked
+                return [dict create selected $response action "connect"]
+            }
+            # Empty OK click, just refresh
+            return [dict create selected "" action "refresh"]
+        }
+        
+        # Fallback - refresh
+        return [dict create selected "" action "refresh"]
+    }
+
+    # Terminal fallback
+    puts ""
+    puts "╔══════════════════════════════════════════════════════════════════╗"
+    puts "║           OpenVPN 3 Profile Manager                              ║"
+    puts "╚══════════════════════════════════════════════════════════════════╝"
+    puts ""
+    puts "  #   Profile Name                          Status"
+    puts "  ─── ────────────────────────────────────  ────────────"
+    
+    set idx 1
+    foreach config $configs {
+        set status [get_session_status $config]
+        set status_indicator "○"
+        if {$status eq "Connected"} {
+            set status_indicator "●"
+        }
+        puts [format "  %-3d %-40s %s %s" $idx $config $status_indicator $status]
+        incr idx
+    }
+    
+    puts ""
+    puts "  Actions:"
+    puts "  ─────────────────────────────────────────────────────────────────"
+    puts "  \[number\]    Connect to profile"
+    puts "  d\[number\]   Delete profile (e.g., d1 to delete first profile)"
+    puts "  i           Import new profile"
+    puts "  q           Quit"
+    puts ""
+    send_user "Enter choice: "
+    flush stdout
+    expect_user -re "(.+)\n"
+    set choice [string trim $expect_out(1,string)]
+    
+    if {$choice eq "q" || $choice eq "Q"} {
+        return [dict create selected "" action "cancel"]
+    }
+    
+    if {$choice eq "i" || $choice eq "I"} {
+        return [dict create selected "" action "import"]
+    }
+    
+    # Check for delete command (d followed by number)
+    if {[regexp -nocase {^d(\d+)$} $choice -> num]} {
+        if {$num >= 1 && $num <= [llength $configs]} {
+            set selected_config [lindex $configs [expr {$num - 1}]]
+            puts ""
+            puts "Are you sure you want to delete '$selected_config'? (y/n)"
+            send_user "> "
+            flush stdout
+            expect_user -re "(.+)\n"
+            set confirm [string tolower [string trim $expect_out(1,string)]]
+            if {$confirm eq "y" || $confirm eq "yes"} {
+                return [dict create selected $selected_config action "delete_profile"]
+            }
+            return [dict create selected "" action "refresh"]
+        }
+    }
+    
+    if {[string is integer -strict $choice] && $choice >= 1 && $choice <= [llength $configs]} {
+        set selected_config [lindex $configs [expr {$choice - 1}]]
+        return [dict create selected $selected_config action "connect"]
+    }
+    
+    puts "Invalid selection."
+    return [dict create selected "" action "refresh"]
+}
+
+proc prompt_ovpn_file {} {
+    # Prompt user to select an .ovpn file
+    set zenity_path [get_zenity]
+    
+    if {$zenity_path ne ""} {
+        set zenity_cmd [list $zenity_path --file-selection \
+            --title "📂 Select OpenVPN Configuration File (.ovpn)" \
+            --file-filter "OpenVPN files (*.ovpn)|*.ovpn" \
+            --file-filter "All files|*"]
+        if {![catch {set response [exec {*}$zenity_cmd]} err]} {
+            set trimmed [string trim $response]
+            if {$trimmed ne "" && [file exists $trimmed]} {
+                return $trimmed
+            }
+        }
+        
+        # Check if user cancelled
+        if {[info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS" && [lindex $::errorCode 2] == 1} {
+            log INFO "File selection cancelled"
+            return ""
+        }
+        
+        log WARN "zenity file selection failed. Falling back to terminal input."
+    }
+    
+    # Terminal fallback
+    puts ""
+    puts "Enter the path to your .ovpn file:"
+    send_user "> "
+    flush stdout
+    expect_user -re "(.+)\n"
+    set path [string trim $expect_out(1,string)]
+    
+    # Expand ~ if present
+    set path [normalize_path $path]
+    
+    if {$path eq "" || ![file exists $path]} {
+        log ERROR "File not found: $path"
+        return ""
+    }
+    
+    return $path
+}
+
+proc prompt_credentials {cred_path} {
+    # Prompt user for username and password, then save to credential file
+    set zenity_path [get_zenity]
+    set username ""
+    set password ""
+    
+    puts ""
+    puts "═══════════════════════════════════════════════════════════════════"
+    puts "  Credential Setup"
+    puts "═══════════════════════════════════════════════════════════════════"
+    puts ""
+    
+    if {$zenity_path ne ""} {
+        # Prompt for username via Zenity
+        set zenity_cmd [list $zenity_path --entry \
+            --title "VPN Credentials" \
+            --text "Username\n\nEnter your VPN username:" \
+            --width 400]
+        if {![catch {set response [exec {*}$zenity_cmd]} err]} {
+            set username [string trim $response]
+        } else {
+            if {[info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS" && [lindex $::errorCode 2] == 1} {
+                log INFO "Credential entry cancelled"
+                return 0
+            }
+            log WARN "zenity failed for username. Falling back to terminal."
+            set zenity_path ""
+        }
+        
+        # Prompt for password via Zenity (hidden)
+        if {$zenity_path ne "" && $username ne ""} {
+            set zenity_cmd [list $zenity_path --password \
+                --title "VPN Password" \
+                --width 400]
+            if {![catch {set response [exec {*}$zenity_cmd]} err]} {
+                set password [string trim $response]
+            } else {
+                if {[info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS" && [lindex $::errorCode 2] == 1} {
+                    log INFO "Credential entry cancelled"
+                    return 0
+                }
+                log WARN "zenity failed for password. Falling back to terminal."
+                set zenity_path ""
+                set username ""
+            }
+        }
+    }
+    
+    # Terminal fallback
+    if {$username eq ""} {
+        puts "Enter your VPN username:"
+        send_user "> "
+        flush stdout
+        expect_user -re "(.+)\n"
+        set username [string trim $expect_out(1,string)]
+    }
+    
+    if {$password eq ""} {
+        puts "Enter your VPN password (input hidden):"
+        send_user "> "
+        flush stdout
+        catch {exec stty -echo}
+        expect_user -re "(.+)\n"
+        set password [string trim $expect_out(1,string)]
+        catch {exec stty echo}
+        send_user "\n"
+    }
+    
+    if {$username eq "" || $password eq ""} {
+        log ERROR "Username and password are required"
+        return 0
+    }
+    
+    # Create directory if needed
+    set cred_dir [file dirname $cred_path]
+    if {![file exists $cred_dir]} {
+        file mkdir $cred_dir
+    }
+    
+    # Write credentials
+    if {[catch {set fh [open $cred_path w]} err]} {
+        log ERROR "Failed to create credential file: $err"
+        return 0
+    }
+    puts $fh $username
+    puts $fh $password
+    close $fh
+    
+    # Secure the file (chmod 600)
+    if {[catch {exec chmod 600 $cred_path} err]} {
+        log WARN "Failed to set permissions on credential file: $err"
+    }
+    
+    log INFO "Credentials saved to $cred_path"
+    return 1
+}
+
+proc import_ovpn_config {ovpn_path config_name} {
+    # Import the .ovpn file into openvpn3
+    puts ""
+    log INFO "Importing configuration from $ovpn_path as '$config_name'..."
+    
+    if {[catch {exec openvpn3 config-import --config $ovpn_path --name $config_name --persistent} err]} {
+        log ERROR "Failed to import configuration: $err"
+        return 0
+    }
+    
+    log INFO "Configuration '$config_name' imported successfully!"
+    return 1
+}
+
+proc setup_wizard {config_name cred_path} {
+    # Interactive setup wizard for first-time users
+    puts ""
+    puts "╔══════════════════════════════════════════════════════════════════╗"
+    puts "║           OpenVPN 3 Setup Wizard                                 ║"
+    puts "╚══════════════════════════════════════════════════════════════════╝"
+    puts ""
+    puts "Configuration '$config_name' not found."
+    puts "Let's set it up now!"
+    puts ""
+    
+    # Step 1: Select .ovpn file
+    puts "Step 1: Select your OpenVPN configuration file (.ovpn)"
+    puts "────────────────────────────────────────────────────────────────────"
+    
+    set ovpn_file [prompt_ovpn_file]
+    if {$ovpn_file eq ""} {
+        puts ""
+        puts "Setup cancelled. You can also import manually:"
+        puts "  openvpn3 config-import --config <your-file.ovpn> --name $config_name --persistent"
+        return 0
+    }
+    
+    # Step 2: Import the config
+    puts ""
+    puts "Step 2: Importing configuration"
+    puts "────────────────────────────────────────────────────────────────────"
+    
+    if {![import_ovpn_config $ovpn_file $config_name]} {
+        return 0
+    }
+    
+    # Step 3: Set up credentials if file doesn't exist
+    if {![file exists $cred_path]} {
+        puts ""
+        puts "Step 3: Set up credentials"
+        puts "────────────────────────────────────────────────────────────────────"
+        puts "Credential file not found at: $cred_path"
+        puts ""
+        
+        set zenity_path [get_zenity]
+        set should_setup 1
+        
+        if {$zenity_path ne ""} {
+            set result [catch {exec $zenity_path --question \
+                --title "Credential Setup" \
+                --text "Would you like to set up your VPN credentials now?\n\nCredentials will be saved to:\n$cred_path" \
+                --ok-label "Yes, set up now" \
+                --cancel-label "Skip for now" \
+                --width 400} err]
+            if {$result != 0} {
+                set should_setup 0
+            }
+        } else {
+            puts "Would you like to set up credentials now? (y/n)"
+            send_user "> "
+            flush stdout
+            expect_user -re "(.+)\n"
+            set answer [string tolower [string trim $expect_out(1,string)]]
+            if {$answer ne "y" && $answer ne "yes"} {
+                set should_setup 0
+            }
+        }
+        
+        if {$should_setup} {
+            if {![prompt_credentials $cred_path]} {
+                puts ""
+                puts "Credential setup skipped. Create the file manually:"
+                puts "  echo 'your_username' > $cred_path"
+                puts "  echo 'your_password' >> $cred_path"
+                puts "  chmod 600 $cred_path"
+                return 0
+            }
+        } else {
+            puts ""
+            puts "Credential setup skipped. Create the file manually before connecting:"
+            puts "  echo 'your_username' > $cred_path"
+            puts "  echo 'your_password' >> $cred_path"
+            puts "  chmod 600 $cred_path"
+            return 0
+        }
+    }
+    
+    puts ""
+    puts "════════════════════════════════════════════════════════════════════"
+    puts "  Setup Complete!"
+    puts "════════════════════════════════════════════════════════════════════"
+    puts ""
+    puts "Configuration '$config_name' is ready to use."
+    puts ""
+    
+    return 1
+}
+
+proc show_status_dialog {title message {disconnect_info {}} {status_rows {}}} {
+    # Render a status dialog; prefer zenity list for tabular view, fall back to terminal text
     puts "$title\n$message\n"
     set zenity_path [get_zenity]
     if {$zenity_path ne ""} {
-        set cmd [list $zenity_path --width 420]
-        if {$disconnect_info ne ""} {
-            set disconnect_text "Disconnect"
-            if {[dict exists $disconnect_info text]} {
-                set disconnect_text [dict get $disconnect_info text]
+        if {[llength $status_rows] > 0} {
+            # Flatten rows into Field/Value columns for a simple grid-like list
+            set list_items {}
+            foreach row $status_rows {
+                lassign $row key val
+                if {$val eq ""} { continue }
+                lappend list_items $key $val
             }
-            set cmd [list $zenity_path --question --title $title --text $message --ok-label $disconnect_text --cancel-label "Keep Connected" --default-cancel]
+            set cmd [list $zenity_path --list \
+                --title $title \
+                --text "VPN Status" \
+                --column "Field" \
+                --column "Value" \
+                --width 600 \
+                --height 480 \
+                --ok-label "Disconnect" \
+                --cancel-label "Keep Connected" \
+                --extra-button "Exit" \
+                {*}$list_items]
             set result [catch {exec {*}$cmd} err]
+            set exit_code 0
+            if {$result != 0 && [info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS"} {
+                set exit_code [lindex $::errorCode 2]
+            }
             if {$result == 0} {
                 if {[dict exists $disconnect_info path] && [dict get $disconnect_info path] ne ""} {
                     if {[catch {exec openvpn3 session-manage --session-path [dict get $disconnect_info path] --disconnect} dis_err]} {
@@ -157,21 +1073,106 @@ proc show_status_dialog {title message {disconnect_info {}}} {
                         log INFO "Disconnect request sent"
                     }
                 }
-                return
-            } elseif {$result == 1} {
-                log INFO "Keeping existing session connected"
-                return
+                return "disconnect"
             }
-            log WARN "zenity dialog failed ($err)."
-            return
+            # Exit button comes back as exit_code 1 with response text = label
+            if {$exit_code == 1 && [string match "*Exit*" $err]} {
+                return "exit"
+            }
+            # Cancel/close = keep connected
+            log INFO "Keeping existing session connected"
+            return "keep"
+        } elseif {$disconnect_info ne ""} {
+            set disconnect_text "Disconnect"
+            if {[dict exists $disconnect_info text]} {
+                set disconnect_text [dict get $disconnect_info text]
+            }
+            set cmd [list $zenity_path --question --title $title --text $message --ok-label $disconnect_text --cancel-label "Keep Connected" --default-cancel --extra-button "Exit" --width 520]
+            set result [catch {exec {*}$cmd} err]
+            set exit_code 0
+            if {$result != 0 && [info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS"} {
+                set exit_code [lindex $::errorCode 2]
+            }
+            if {$result == 0} {
+                if {[dict exists $disconnect_info path] && [dict get $disconnect_info path] ne ""} {
+                    if {[catch {exec openvpn3 session-manage --session-path [dict get $disconnect_info path] --disconnect} dis_err]} {
+                        log ERROR "Disconnect failed: $dis_err"
+                    } else {
+                        log INFO "Disconnect request sent"
+                    }
+                }
+                return "disconnect"
+            }
+            if {$exit_code == 1 && [string match "*Exit*" $err]} {
+                return "exit"
+            }
+            log INFO "Keeping existing session connected"
+            return "keep"
         } else {
-            if {![catch {exec $zenity_path --info --title $title --text $message --width 420} err]} {
-                return
+            if {![catch {exec $zenity_path --info --title $title --text $message --width 520} err]} {
+                return "info"
             }
             log WARN "zenity info dialog failed ($err)."
         }
     }
     puts "$title\n$message"
+    return "keep"
+}
+
+proc format_section {title kv_pairs} {
+    # Align key/value rows into a simple grid section
+    set lines {}
+    lappend lines $title
+    set key_width 14
+    foreach pair $kv_pairs {
+        lassign $pair k v
+        if {$v eq ""} { continue }
+        set padded_key [format "%-*s" $key_width $k]
+        lappend lines "  $padded_key $v"
+    }
+    return [join $lines "\n"]
+}
+
+proc format_status_message {config_name session_info} {
+    # Create a readable, grid-like status layout for dialogs
+    set sections {}
+
+    # Overview block
+    set overview_rows {}
+    lappend overview_rows [list "Config" $config_name]
+    if {[dict exists $session_info status]} { lappend overview_rows [list "Status" [dict get $session_info status]] }
+    if {[dict exists $session_info connected]} { lappend overview_rows [list "Remote" [dict get $session_info connected]] }
+    if {[dict exists $session_info device]} { lappend overview_rows [list "Device" [dict get $session_info device]] }
+    if {[dict exists $session_info created]} { lappend overview_rows [list "Created" [dict get $session_info created]] }
+    if {[dict exists $session_info pid]} { lappend overview_rows [list "PID" [dict get $session_info pid]] }
+    if {[dict exists $session_info path]} { lappend overview_rows [list "DBus Path" [dict get $session_info path]] }
+    lappend sections [format_section "Overview" $overview_rows]
+
+    # Details block (extra metadata if available)
+    set detail_rows {}
+    if {[dict exists $session_info owner]} { lappend detail_rows [list "Owner" [dict get $session_info owner]] }
+    if {[dict exists $session_info config]} { lappend detail_rows [list "Config name" [dict get $session_info config]] }
+    # Prefer connected/ status already shown above; skip duplicates
+    if {[llength $detail_rows] > 0} {
+        lappend sections [format_section "Details" $detail_rows]
+    }
+
+    return [join $sections "\n\n"]
+}
+
+proc build_status_rows {config_name session_info} {
+    # Build list of key/value rows for zenity list view
+    set rows {}
+    lappend rows [list "Config" $config_name]
+    if {[dict exists $session_info status]} { lappend rows [list "Status" [dict get $session_info status]] }
+    if {[dict exists $session_info connected]} { lappend rows [list "Remote" [dict get $session_info connected]] }
+    if {[dict exists $session_info device]} { lappend rows [list "Device" [dict get $session_info device]] }
+    if {[dict exists $session_info created]} { lappend rows [list "Created" [dict get $session_info created]] }
+    if {[dict exists $session_info pid]} { lappend rows [list "PID" [dict get $session_info pid]] }
+    if {[dict exists $session_info path]} { lappend rows [list "DBus Path" [dict get $session_info path]] }
+    if {[dict exists $session_info owner]} { lappend rows [list "Owner" [dict get $session_info owner]] }
+    if {[dict exists $session_info config]} { lappend rows [list "Config name" [dict get $session_info config]] }
+    return $rows
 }
 
 proc prompt_otp {} {
@@ -179,19 +1180,19 @@ proc prompt_otp {} {
     set zenity_path [get_zenity]
 
     if {$zenity_path ne ""} {
-        set zenity_cmd [list $zenity_path --entry --title "OpenVPN MFA" --text $prompt_text --width 320]
+        set zenity_cmd [list $zenity_path --entry --title "OpenVPN MFA" --text "Two-Factor Authentication\n\n$prompt_text" --width 380]
         if {![catch {set response [exec {*}$zenity_cmd]} err]} {
             set trimmed [string trim $response]
             if {$trimmed eq ""} {
                 log ERROR "OTP cannot be empty"
-                exit 1
+                return ""
             }
             return $trimmed
         }
 
         if {[info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS" && [lindex $::errorCode 2] == 1} {
             log INFO "OTP entry cancelled"
-            exit 1
+            return ""
         }
 
         log WARN "zenity prompt failed ($err). Falling back to terminal input."
@@ -208,27 +1209,315 @@ proc prompt_otp {} {
     set trimmed_code [string trim $code]
     if {$trimmed_code eq ""} {
         log ERROR "OTP cannot be empty"
-        exit 1
+        return ""
     }
     return $trimmed_code
 }
 
 # --- Argument parsing -----------------------------------------------------
-set config_name "wha-traffic"
-set cred_path "~/.config/openvpn3/credentials"
-
-if {[llength $argv] >= 1} {
-    set config_name [lindex $argv 0]
+proc print_usage {} {
+    puts "OpenVPN 3 Automation Helper"
+    puts ""
+    puts "Usage:"
+    puts "  ./openvpn3-auto.expect \[OPTIONS\] \[CONFIG_NAME\] \[CREDENTIAL_FILE\]"
+    puts ""
+    puts "Options:"
+    puts "  --help, -h       Show this help message"
+    puts "  --check, -c      Check dependencies and show installation instructions"
+    puts "  --list, -l       Show profile manager GUI to choose a VPN profile"
+    puts "  --setup, -s      Run the setup wizard (import .ovpn and set credentials)"
+    puts "  --delete, -d     Delete a VPN profile"
+    puts "  --version, -v    Show version information"
+    puts ""
+    puts "Arguments:"
+    puts "  CONFIG_NAME      OpenVPN configuration name (default: shows profile selector)"
+    puts "  CREDENTIAL_FILE  Path to credentials file (default: ~/.config/openvpn3/credentials)"
+    puts ""
+    puts "Examples:"
+    puts "  ./openvpn3-auto.expect                           # Show profile manager"
+    puts "  ./openvpn3-auto.expect --list                    # Show profile manager"
+    puts "  ./openvpn3-auto.expect --setup                   # Import new profile"
+    puts "  ./openvpn3-auto.expect --delete                  # Delete a profile"
+    puts "  ./openvpn3-auto.expect --check                   # Check dependencies"
+    puts "  ./openvpn3-auto.expect my-vpn                    # Connect to 'my-vpn' directly"
+    puts "  ./openvpn3-auto.expect my-vpn ~/my-creds.txt     # Custom config and creds"
+    puts ""
 }
-if {[llength $argv] >= 2} {
-    set cred_path [lindex $argv 1]
+
+set config_name ""
+set cred_path "~/.config/openvpn3/credentials"
+set check_only 0
+set setup_only 0
+set delete_mode 0
+set list_profiles 0
+set config_specified 0
+
+# Parse arguments
+set positional_args {}
+foreach arg $argv {
+    switch -glob -- $arg {
+        "--help" - "-h" {
+            print_usage
+            exit 0
+        }
+        "--check" - "-c" {
+            set check_only 1
+        }
+        "--list" - "-l" {
+            set list_profiles 1
+        }
+        "--setup" - "-s" {
+            set setup_only 1
+        }
+        "--delete" - "-d" {
+            set delete_mode 1
+        }
+        "--version" - "-v" {
+            puts "OpenVPN 3 Automation Helper v1.4.0"
+            exit 0
+        }
+        "-*" {
+            puts stderr "Unknown option: $arg"
+            print_usage
+            exit 1
+        }
+        default {
+            lappend positional_args $arg
+        }
+    }
+}
+
+# Handle positional arguments
+if {[llength $positional_args] >= 1} {
+    set config_name [lindex $positional_args 0]
+    set config_specified 1
+}
+if {[llength $positional_args] >= 2} {
+    set cred_path [lindex $positional_args 1]
 }
 set cred_path [normalize_path $cred_path]
 
-if {![check_config_exists $config_name]} {
-    log ERROR "Configuration profile '$config_name' not found."
-    puts stderr "Please import it first using: openvpn3 config-import --config <path_to_ovpn> --name $config_name --persistent"
+# --- Dependency check (always run first) ----------------------------------
+if {$check_only} {
+    # Just show dependency status and exit
+    if {[print_dependency_status]} {
+        exit 0
+    } else {
+        exit 1
+    }
+}
+
+# Run silent dependency check for required packages
+lassign [check_dependencies] missing_required missing_optional distro
+
+if {[llength $missing_required] > 0} {
+    # Show full dependency status with install instructions
+    print_dependency_status
     exit 1
+}
+
+# --- Setup mode (force setup wizard) --------------------------------------
+if {$setup_only} {
+    # Use a default name if none specified for setup
+    if {$config_name eq ""} {
+        set config_name "my-vpn"
+    }
+    if {![setup_wizard $config_name $cred_path]} {
+        exit 1
+    }
+    exit 0
+}
+
+# --- Delete mode ----------------------------------------------------------
+if {$delete_mode} {
+    # If a specific config name was provided, delete it directly
+    if {$config_name ne ""} {
+        set zenity_path [get_zenity]
+        set confirmed 0
+        
+        if {$zenity_path ne ""} {
+            set confirm_cmd [list $zenity_path --question \
+                --title "Confirm Deletion" \
+                --text "Are you sure you want to delete:\n\n$config_name\n\nThis action cannot be undone." \
+                --ok-label "Yes, Delete" \
+                --cancel-label "Cancel" \
+                --default-cancel \
+                --width 380]
+            set confirm_result [catch {exec {*}$confirm_cmd} confirm_err]
+            if {$confirm_result == 0} {
+                set confirmed 1
+            }
+        } else {
+            puts "Are you sure you want to delete '$config_name'? (y/n)"
+            send_user "> "
+            flush stdout
+            expect_user -re "(.+)\n"
+            set answer [string tolower [string trim $expect_out(1,string)]]
+            if {$answer eq "y" || $answer eq "yes"} {
+                set confirmed 1
+            }
+        }
+        
+        if {$confirmed} {
+            if {[delete_profile $config_name]} {
+                puts "Profile '$config_name' deleted successfully."
+                exit 0
+            } else {
+                exit 1
+            }
+        } else {
+            puts "Deletion cancelled."
+            exit 0
+        }
+    } else {
+        # Show delete dialog to select profile
+        set to_delete [show_delete_dialog]
+        foreach profile $to_delete {
+            delete_profile $profile
+        }
+        exit 0
+    }
+}
+
+# --- Profile Selection ----------------------------------------------------
+# If no config specified or --list flag used, show profile selector
+if {$config_name eq "" || $list_profiles} {
+    while {1} {
+        set selection [show_profile_selector]
+        set action [dict get $selection action]
+        set selected [dict get $selection selected]
+        
+        switch $action {
+            "cancel" {
+                log INFO "Exiting"
+                exit 0
+            }
+            "refresh" {
+                # User cancelled an action, just refresh the profile selector
+                continue
+            }
+            "delete_profile" {
+                # Delete the specific selected profile
+                log DEBUG "delete_profile action received, selected='$selected'"
+                if {[delete_profile $selected]} {
+                    set zenity_path [get_zenity]
+                    if {$zenity_path ne ""} {
+                        catch {exec $zenity_path --info \
+                            --title "Profile Deleted" \
+                            --text "Profile '$selected' has been deleted successfully." \
+                            --width 380}
+                    } else {
+                        puts "Profile '$selected' deleted successfully."
+                    }
+                } else {
+                    set zenity_path [get_zenity]
+                    if {$zenity_path ne ""} {
+                        catch {exec $zenity_path --error \
+                            --title "Delete Failed" \
+                            --text "Failed to delete profile '$selected'.\n\nThe profile may be in use or you may not have permission." \
+                            --width 380}
+                    } else {
+                        puts "Failed to delete profile '$selected'."
+                    }
+                }
+                # Loop back to show profile selector again
+                continue
+            }
+            "delete" {
+                # Show delete dialog and handle deletion (legacy, for --delete flag)
+                set to_delete [show_delete_dialog]
+                foreach profile $to_delete {
+                    if {[delete_profile $profile]} {
+                        set zenity_path [get_zenity]
+                        if {$zenity_path ne ""} {
+                            catch {exec $zenity_path --info \
+                                --title "Profile Deleted" \
+                                --text "Profile '$profile' has been deleted successfully." \
+                                --width 380}
+                        }
+                    } else {
+                        set zenity_path [get_zenity]
+                        if {$zenity_path ne ""} {
+                            catch {exec $zenity_path --error \
+                                --title "Delete Failed" \
+                                --text "Failed to delete profile '$profile'." \
+                                --width 380}
+                        }
+                    }
+                }
+                # Loop back to show profile selector again
+                continue
+            }
+            "import" {
+                # User wants to import a new profile
+                set config_name "my-vpn"
+                
+                # Ask for config name
+                set zenity_path [get_zenity]
+                if {$zenity_path ne ""} {
+                    set zenity_cmd [list $zenity_path --entry \
+                        --title "New Profile" \
+                        --text "Name your profile\n\nEnter a name for the new VPN profile:" \
+                        --entry-text "my-vpn" \
+                        --width 400]
+                    if {![catch {set response [exec {*}$zenity_cmd]} err]} {
+                        set config_name [string trim $response]
+                    } else {
+                        # User cancelled, go back to profile selector
+                        continue
+                    }
+                } else {
+                    puts "Enter a name for the new VPN profile (default: my-vpn):"
+                    send_user "> "
+                    flush stdout
+                    expect_user -re "(.*)\n"
+                    set input [string trim $expect_out(1,string)]
+                    if {$input ne ""} {
+                        set config_name $input
+                    }
+                }
+                
+                if {$config_name eq ""} {
+                    set config_name "my-vpn"
+                }
+                
+                if {![setup_wizard $config_name $cred_path]} {
+                    # Setup failed or cancelled, go back to selector
+                    set config_name ""
+                    continue
+                }
+                # After successful import, continue to connect
+                break
+            }
+            "connect" {
+                set config_name $selected
+                break
+            }
+        }
+    }
+}
+
+# --- Configuration and credential validation ------------------------------
+if {![check_config_exists $config_name]} {
+    # Config doesn't exist - run setup wizard
+    if {![setup_wizard $config_name $cred_path]} {
+        exit 1
+    }
+}
+
+# Check if credentials file exists
+if {![file exists $cred_path]} {
+    puts ""
+    puts "Credential file not found: $cred_path"
+    puts ""
+    if {![prompt_credentials $cred_path]} {
+        puts stderr "Cannot proceed without credentials."
+        puts stderr "Create the file manually:"
+        puts stderr "  echo 'your_username' > $cred_path"
+        puts stderr "  echo 'your_password' >> $cred_path"
+        puts stderr "  chmod 600 $cred_path"
+        exit 1
+    }
 }
 
 lassign [load_credentials $cred_path] username password
@@ -237,34 +1526,85 @@ lassign [load_credentials $cred_path] username password
 set session_info [check_existing_session $config_name]
 set status_title "OpenVPN 3 Status ($config_name)"
 if {[dict get $session_info active]} {
-    set status_msg "Config: $config_name\n"
-    if {[dict exists $session_info status]} {
-        append status_msg "Status: [dict get $session_info status]\n"
-    }
-    if {[dict exists $session_info device] && [dict get $session_info device] ne ""} {
-        append status_msg "Device: [dict get $session_info device]\n"
-    }
-    if {[dict exists $session_info connected] && [dict get $session_info connected] ne ""} {
-        append status_msg "Remote: [dict get $session_info connected]\n"
-    }
-    if {[dict exists $session_info path]} {
-        append status_msg "DBus Path: [dict get $session_info path]\n"
-    }
-    if {[dict exists $session_info created]} {
-        append status_msg "Created: [dict get $session_info created]\n"
-    }
-    if {[dict exists $session_info pid]} {
-        append status_msg "PID: [dict get $session_info pid]\n"
-    }
-    if {[dict exists $session_info raw]} {
-        append status_msg "\nDetails:\n[dict get $session_info raw]"
-    }
+    set status_msg [format_status_message $config_name $session_info]
+    set status_rows [build_status_rows $config_name $session_info]
     set disconnect_info [dict create text "Disconnect" path "" ]
     if {[dict exists $session_info path]} {
         dict set disconnect_info path [dict get $session_info path]
     }
-    show_status_dialog $status_title $status_msg $disconnect_info
-    exit 0
+    set status_action [show_status_dialog $status_title $status_msg $disconnect_info $status_rows]
+    if {$status_action eq "exit"} {
+        exit 0
+    }
+    # Keep or disconnect: return to profile selector instead of exiting
+    while {1} {
+        set selection [show_profile_selector]
+        set action [dict get $selection action]
+        set selected [dict get $selection selected]
+        switch $action {
+            "cancel" { exit 0 }
+            "refresh" { continue }
+            "delete_profile" { continue }
+            "delete" {
+                set to_delete [show_delete_dialog]
+                foreach profile $to_delete {
+                    if {[delete_profile $profile]} {
+                        set zenity_path [get_zenity]
+                        if {$zenity_path ne ""} {
+                            catch {exec $zenity_path --info \
+                                --title "Profile Deleted" \
+                                --text "Profile '$profile' has been deleted successfully." \
+                                --width 380}
+                        }
+                    } else {
+                        set zenity_path [get_zenity]
+                        if {$zenity_path ne ""} {
+                            catch {exec $zenity_path --error \
+                                --title "Delete Failed" \
+                                --text "Failed to delete profile '$profile'." \
+                                --width 380}
+                        }
+                    }
+                }
+                continue
+            }
+            "import" {
+                set config_name "my-vpn"
+                set zenity_path [get_zenity]
+                if {$zenity_path ne ""} {
+                    set zenity_cmd [list $zenity_path --entry \
+                        --title "New Profile" \
+                        --text "Name your profile\n\nEnter a name for the new VPN profile:" \
+                        --entry-text "my-vpn" \
+                        --width 400]
+                    if {![catch {set response [exec {*}$zenity_cmd]} err]} {
+                        set config_name [string trim $response]
+                    } else {
+                        continue
+                    }
+                } else {
+                    puts "Enter a name for the new VPN profile (default: my-vpn):"
+                    send_user "> "
+                    flush stdout
+                    expect_user -re "(.*)\n"
+                    set input [string trim $expect_out(1,string)]
+                    if {$input ne ""} {
+                        set config_name $input
+                    }
+                }
+                if {$config_name eq ""} { set config_name "my-vpn" }
+                if {![setup_wizard $config_name $cred_path]} {
+                    set config_name ""
+                    continue
+                }
+                break
+            }
+            "connect" {
+                set config_name $selected
+                break
+            }
+        }
+    }
 }
 
 log INFO "No active session detected for '$config_name'."
@@ -285,8 +1625,39 @@ expect {
     eof { puts stderr "openvpn3 exited unexpectedly"; exit 1 }
 }
 
-set otp [prompt_otp]
-send -- "$otp\r"
+# Wait for OTP/TOTP prompt from the VPN server
+expect {
+    -re "TOTP|OTP|Authenticator|Verification|Challenge|2FA|one-time|totp" {
+        set otp [prompt_otp]
+        if {$otp eq ""} {
+            # OTP cancelled - kill the spawned process and restart
+            catch {close}
+            catch {wait}
+            log INFO "Returning to profile selector..."
+            # Re-exec the script to go back to profile selector
+            exec [info script] >@stdout 2>@stderr <@stdin &
+            exit 0
+        }
+        send -- "$otp\r"
+    }
+    "Connected" {
+        # No OTP required, already connected
+        log INFO "Connected without OTP"
+    }
+    timeout {
+        # Assume OTP is needed if we timeout (server might use different prompt)
+        set otp [prompt_otp]
+        if {$otp eq ""} {
+            catch {close}
+            catch {wait}
+            log INFO "Returning to profile selector..."
+            exec [info script] >@stdout 2>@stderr <@stdin &
+            exit 0
+        }
+        send -- "$otp\r"
+    }
+    eof { puts stderr "openvpn3 exited unexpectedly"; exit 1 }
+}
 
 # Hand over control so the user can watch logs and Ctrl+C when done.
 interact
