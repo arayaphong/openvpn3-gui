@@ -1,0 +1,292 @@
+#!/usr/bin/env -S expect -f
+# Helper to start openvpn3 sessions while auto-filling username/password.
+# Usage:
+#   ./openvpn3-auto.expect [CONFIG_NAME] [CREDENTIAL_FILE]
+# Defaults:
+#   CONFIG_NAME     -> wha-traffic
+#   CREDENTIAL_FILE -> ~/.config/openvpn3/credentials (first line user, second line password)
+
+set timeout -1
+
+# --- Helper procedures ----------------------------------------------------
+proc log {level message} {
+    set ts [timestamp -format "%Y-%m-%dT%H:%M:%S"]
+    set channel stdout
+    if {$level eq "ERROR" || $level eq "WARN"} {
+        set channel stderr
+    }
+    puts $channel "$ts $level: $message"
+}
+
+proc get_zenity {} {
+    if {![info exists ::env(DISPLAY)]} { return "" }
+    return [auto_execok zenity]
+}
+
+proc normalize_path {path} {
+    if {[string match ~* $path]} {
+        set expanded [string map [list ~ $::env(HOME)] $path]
+        return [file normalize $expanded]
+    }
+    return [file normalize $path]
+}
+
+proc load_credentials {path} {
+    if {[catch {set fh [open $path r]} err]} {
+        log ERROR "Unable to open $path ($err)"
+        exit 1
+    }
+    set lines {}
+    while {[gets $fh line] >= 0} {
+        set trimmed [string trim $line]
+        if {$trimmed eq ""} {continue}
+        lappend lines $trimmed
+    }
+    close $fh
+    if {[llength $lines] < 2} {
+        log ERROR "Credential file must contain username on line 1 and password on line 2"
+        exit 1
+    }
+    return [list [lindex $lines 0] [lindex $lines 1]]
+}
+
+proc check_existing_session {config_name} {
+    if {[catch {set output [exec openvpn3 sessions-list]} err]} {
+        return [dict create active 0 error $err]
+    }
+
+    if {[string match *No\ sessions\ available* $output]} {
+        return [dict create active 0]
+    }
+
+    set sections {}
+    set chunk ""
+    foreach line [split $output "\n"] {
+        if {[string trim $line] eq ""} {
+            if {$chunk ne ""} {
+                lappend sections [string trim $chunk]
+                set chunk ""
+            }
+            continue
+        }
+        append chunk $line "\n"
+    }
+    if {$chunk ne ""} {
+        lappend sections [string trim $chunk]
+    }
+
+    set active_session {}
+    foreach section $sections {
+        if {![string match *Config\ name:* $section]} {
+            continue
+        }
+
+        set session [dict create raw $section]
+        foreach line [split $section "\n"] {
+            set sanitized [string trim $line]
+            if {[regexp {^Path:\s*(\S+)} $sanitized -> value]} { dict set session path $value; continue }
+            if {[regexp {^Created:\s*(.*?)\s+PID:\s*(\d+)} $sanitized -> created pid]} {
+                dict set session created [string trim $created]
+                dict set session pid $pid
+                continue
+            }
+            if {[regexp {^Owner:\s*(.*)} $sanitized -> value]} { dict set session owner [string trim $value]; continue }
+            if {[regexp {^Config name:\s*(.*)} $sanitized -> value]} { dict set session config [string trim $value]; continue }
+            if {[regexp {^Connected to:\s*(.*)} $sanitized -> value]} { dict set session connected [string trim $value]; continue }
+            if {[regexp {^Device:\s*(.*)} $sanitized -> value]} { dict set session device [string trim $value]; continue }
+            if {[regexp {^Status:\s*(.*)} $sanitized -> value]} { dict set session status [string trim $value]; continue }
+        }
+
+        if {![dict exists $session config] || [dict get $session config] ne $config_name} {
+            continue
+        }
+
+        set status_text ""
+        if {[dict exists $session status]} {
+            set status_text [dict get $session status]
+        }
+        if {$active_session eq "" && [string match {*Client connected*} $status_text]} {
+            set active_session $session
+        }
+    }
+
+    if {$active_session ne ""} {
+        return [dict merge [dict create active 1] $active_session]
+    }
+
+    return [dict create active 0]
+}
+
+proc check_config_exists {config_name} {
+    if {[catch {set output [exec openvpn3 configs-list]} err]} {
+        log ERROR "Failed to list configurations: $err"
+        exit 1
+    }
+
+    foreach line [split $output "\n"] {
+        set trimmed [string trim $line]
+        if {$trimmed eq "" || [string match "Configuration Name*" $trimmed] || [string match "---*" $trimmed]} {
+            continue
+        }
+        # The first word should be the config name
+        set name [lindex [split $trimmed] 0]
+        if {$name eq $config_name} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc show_status_dialog {title message {disconnect_info {}}} {
+    puts "$title\n$message\n"
+    set zenity_path [get_zenity]
+    if {$zenity_path ne ""} {
+        set cmd [list $zenity_path --width 420]
+        if {$disconnect_info ne ""} {
+            set disconnect_text "Disconnect"
+            if {[dict exists $disconnect_info text]} {
+                set disconnect_text [dict get $disconnect_info text]
+            }
+            set cmd [list $zenity_path --question --title $title --text $message --ok-label $disconnect_text --cancel-label "Keep Connected" --default-cancel]
+            set result [catch {exec {*}$cmd} err]
+            if {$result == 0} {
+                if {[dict exists $disconnect_info path] && [dict get $disconnect_info path] ne ""} {
+                    if {[catch {exec openvpn3 session-manage --session-path [dict get $disconnect_info path] --disconnect} dis_err]} {
+                        log ERROR "Disconnect failed: $dis_err"
+                    } else {
+                        log INFO "Disconnect request sent"
+                    }
+                }
+                return
+            } elseif {$result == 1} {
+                log INFO "Keeping existing session connected"
+                return
+            }
+            log WARN "zenity dialog failed ($err)."
+            return
+        } else {
+            if {![catch {exec $zenity_path --info --title $title --text $message --width 420} err]} {
+                return
+            }
+            log WARN "zenity info dialog failed ($err)."
+        }
+    }
+    puts "$title\n$message"
+}
+
+proc prompt_otp {} {
+    set prompt_text "Enter Authenticator Code:"
+    set zenity_path [get_zenity]
+
+    if {$zenity_path ne ""} {
+        set zenity_cmd [list $zenity_path --entry --title "OpenVPN MFA" --text $prompt_text --width 320]
+        if {![catch {set response [exec {*}$zenity_cmd]} err]} {
+            set trimmed [string trim $response]
+            if {$trimmed eq ""} {
+                log ERROR "OTP cannot be empty"
+                exit 1
+            }
+            return $trimmed
+        }
+
+        if {[info exists ::errorCode] && [lindex $::errorCode 0] eq "CHILDSTATUS" && [lindex $::errorCode 2] == 1} {
+            log INFO "OTP entry cancelled"
+            exit 1
+        }
+
+        log WARN "zenity prompt failed ($err). Falling back to terminal input."
+    }
+
+    set prompt "$prompt_text "
+    send_user $prompt
+    flush stdout
+    catch {exec stty -echo}
+    expect_user -re "(.+)\n"
+    set code $expect_out(1,string)
+    catch {exec stty echo}
+    send_user "\n"
+    set trimmed_code [string trim $code]
+    if {$trimmed_code eq ""} {
+        log ERROR "OTP cannot be empty"
+        exit 1
+    }
+    return $trimmed_code
+}
+
+# --- Argument parsing -----------------------------------------------------
+set config_name "wha-traffic"
+set cred_path "~/.config/openvpn3/credentials"
+
+if {[llength $argv] >= 1} {
+    set config_name [lindex $argv 0]
+}
+if {[llength $argv] >= 2} {
+    set cred_path [lindex $argv 1]
+}
+set cred_path [normalize_path $cred_path]
+
+if {![check_config_exists $config_name]} {
+    log ERROR "Configuration profile '$config_name' not found."
+    puts stderr "Please import it first using: openvpn3 config-import --config <path_to_ovpn> --name $config_name --persistent"
+    exit 1
+}
+
+lassign [load_credentials $cred_path] username password
+
+# --- Existing session check & status dialog ------------------------------
+set session_info [check_existing_session $config_name]
+set status_title "OpenVPN 3 Status ($config_name)"
+if {[dict get $session_info active]} {
+    set status_msg "Config: $config_name\n"
+    if {[dict exists $session_info status]} {
+        append status_msg "Status: [dict get $session_info status]\n"
+    }
+    if {[dict exists $session_info device] && [dict get $session_info device] ne ""} {
+        append status_msg "Device: [dict get $session_info device]\n"
+    }
+    if {[dict exists $session_info connected] && [dict get $session_info connected] ne ""} {
+        append status_msg "Remote: [dict get $session_info connected]\n"
+    }
+    if {[dict exists $session_info path]} {
+        append status_msg "DBus Path: [dict get $session_info path]\n"
+    }
+    if {[dict exists $session_info created]} {
+        append status_msg "Created: [dict get $session_info created]\n"
+    }
+    if {[dict exists $session_info pid]} {
+        append status_msg "PID: [dict get $session_info pid]\n"
+    }
+    if {[dict exists $session_info raw]} {
+        append status_msg "\nDetails:\n[dict get $session_info raw]"
+    }
+    set disconnect_info [dict create text "Disconnect" path "" ]
+    if {[dict exists $session_info path]} {
+        dict set disconnect_info path [dict get $session_info path]
+    }
+    show_status_dialog $status_title $status_msg $disconnect_info
+    exit 0
+}
+
+log INFO "No active session detected for '$config_name'."
+
+# --- Start session --------------------------------------------------------
+log INFO "Starting openvpn3 session using config '$config_name'"
+spawn openvpn3 session-start --config $config_name
+
+expect {
+    "Auth User name:" { send -- "$username\r" }
+    timeout { puts stderr "Timed out waiting for username prompt"; exit 1 }
+    eof { puts stderr "openvpn3 exited unexpectedly"; exit 1 }
+}
+
+expect {
+    "Auth Password:" { send -- "$password\r" }
+    timeout { puts stderr "Timed out waiting for password prompt"; exit 1 }
+    eof { puts stderr "openvpn3 exited unexpectedly"; exit 1 }
+}
+
+set otp [prompt_otp]
+send -- "$otp\r"
+
+# Hand over control so the user can watch logs and Ctrl+C when done.
+interact
