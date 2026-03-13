@@ -211,7 +211,7 @@ class OpenVPNGui : ApplicationWindow {
         this.vpn_manager.pid_file_path = GLib.Path.build_filename(GLib.Environment.get_tmp_dir(), "openvpn-gui-" + GLib.Environment.get_user_name() + ".pid");
 
         this.set_title("OpenVPN GUI");
-        this.set_default_size(600, 400);
+        this.set_default_size(600, 320);
         this.set_resizable(false);
         this.set_border_width(10);
 
