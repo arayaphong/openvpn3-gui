@@ -1,0 +1,2 @@
+# Meson options for OpenVPN GUI
+# prefix and other standard options are built-in to Meson
