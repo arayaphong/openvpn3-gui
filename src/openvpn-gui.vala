@@ -40,6 +40,57 @@ class OpenVPNManager : Object {
             return false;
         }
     }
+
+    private string get_path_from_openvpn3_block(string block_text) {
+        foreach (string line in block_text.split("\n")) {
+            if (line.contains("Path:")) {
+                var parts = line.split("Path:");
+                if (parts.length > 1) {
+                    return parts[1].strip();
+                }
+            }
+        }
+        return "";
+    }
+
+    private bool has_connected_session_for_config(out string found_session_path) {
+        found_session_path = "";
+
+        try {
+            string stdout_str;
+            string stderr_str;
+            int exit_status;
+
+            Process.spawn_command_line_sync(
+                this.openvpn3_path + " sessions-list",
+                out stdout_str,
+                out stderr_str,
+                out exit_status
+            );
+
+            if (exit_status != 0 || stdout_str.strip() == "" || stdout_str.contains("No sessions available")) {
+                return false;
+            }
+
+            var blocks = stdout_str.split("-----------------------------------------------------------------------------");
+            foreach (string block in blocks) {
+                if (!block.contains("Status: Connection, Client connected")) {
+                    continue;
+                }
+
+                if (this.config_file != "" && !block.contains("Config name: " + this.config_file)) {
+                    continue;
+                }
+
+                found_session_path = get_path_from_openvpn3_block(block);
+                return true;
+            }
+        } catch (Error e) {
+            return false;
+        }
+
+        return false;
+    }
     
     public new void connect() {
         if (this.config_file == "") {
@@ -72,12 +123,20 @@ class OpenVPNManager : Object {
                 try {
                     this.process.wait_async.end(res);
                     int exit_code = this.process.get_exit_status();
-                    if (this.connected) {
+                    string verified_session_path;
+                    if (has_connected_session_for_config(out verified_session_path)) {
+                        this.connected = true;
+                        if (verified_session_path != "") {
+                            this.session_path = verified_session_path;
+                        }
+                        output_received("✓ VPN Connected Successfully!\n");
                         output_received("\n--- OpenVPN 3 command completed; VPN session is managed by background service ---\n");
                     } else if (exit_code != 0) {
+                        this.connected = false;
                         error_received("OpenVPN 3 session-start failed with exit code " + exit_code.to_string());
                     } else {
-                        error_received("OpenVPN 3 exited without confirming tunnel activation.");
+                        this.connected = false;
+                        error_received("OpenVPN 3 exited without an active connected session.");
                     }
                 } catch (Error e) {
                     error_received("Wait error: " + e.message);
@@ -106,8 +165,6 @@ class OpenVPNManager : Object {
                     var parts = line.split("Session path:");
                     if (parts.length > 1) {
                         this.session_path = parts[1].strip();
-                        // OpenVPN3 created a session; mark as connected from UI perspective.
-                        this.connected = true;
                     }
                 }
                 
@@ -143,6 +200,7 @@ class OpenVPNManager : Object {
             string? line = yield dis.read_line_async(Priority.DEFAULT);
             while (line != null) {
                 output_received("[ERROR] " + line + "\n");
+                error_received(line);
                 line = yield dis.read_line_async(Priority.DEFAULT);
             }
         } catch (GLib.IOError e) {
@@ -176,14 +234,14 @@ class OpenVPNManager : Object {
                         this.session_path = "";
                         output_received("OpenVPN 3 disconnect command sent.\n");
                     } else {
-                        output_received("OpenVPN 3 disconnect returned code " + disconnect_proc.get_exit_status().to_string() + "\n");
+                        error_received("OpenVPN 3 disconnect failed with exit code " + disconnect_proc.get_exit_status().to_string());
                     }
                 } catch (Error e) {
-                    output_received("OpenVPN 3 disconnect error: " + e.message + "\n");
+                    error_received("OpenVPN 3 disconnect error: " + e.message);
                 }
             });
         } catch (Error e) {
-            output_received("OpenVPN 3 disconnect start error: " + e.message + "\n");
+            error_received("OpenVPN 3 disconnect start error: " + e.message);
         }
         
         output_received("Disconnect signal sent.\n");
