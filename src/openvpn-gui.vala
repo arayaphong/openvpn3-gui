@@ -196,6 +196,7 @@ class OpenVPNGui : ApplicationWindow {
     private Button disconnect_btn;
     private Label status_label;
     private Label config_label;
+    private Label creds_status_label;
     private TextView text_view;
     private TextView history_view;
     private Image status_icon;
@@ -210,7 +211,7 @@ class OpenVPNGui : ApplicationWindow {
         this.set_title("OpenVPN GUI");
         this.set_default_size(600, 320);
         this.set_resizable(false);
-        this.set_border_width(10);
+        this.set_border_width(0);
 
         build_ui();
 
@@ -223,6 +224,8 @@ class OpenVPNGui : ApplicationWindow {
     }
 
     private void build_ui() {
+        var window_root = new Box(Orientation.VERTICAL, 0);
+
         var root = new Box(Orientation.VERTICAL, 12);
         root.set_margin_top(14);
         root.set_margin_bottom(14);
@@ -328,14 +331,68 @@ class OpenVPNGui : ApplicationWindow {
         info_card.add(info_box);
         root.pack_start(info_card, false, false, 0);
 
+        this.creds_status_label = new Label(null);
+        this.creds_status_label.set_xalign(0.0f);
+        this.creds_status_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE);
+        update_credential_source_label();
+
+        var bottom_status_row = new Box(Orientation.HORIZONTAL, 1);
+        bottom_status_row.set_margin_start(14);
+        bottom_status_row.set_margin_end(14);
+        bottom_status_row.set_margin_bottom(6);
+        var bottom_info_indicator = create_info_indicator_widget();
+        bottom_info_indicator.set_margin_start(3);
+        bottom_info_indicator.set_margin_end(6);
+        bottom_status_row.pack_start(bottom_info_indicator, false, false, 0);
+        bottom_status_row.pack_start(this.creds_status_label, true, true, 0);
+
         create_logs_dialog();
 
-        this.add(root);
+        window_root.pack_start(root, true, true, 0);
+        window_root.pack_end(bottom_status_row, false, false, 0);
+
+        this.add(window_root);
         this.show_all();
 
         // Connect signals
         this.vpn_manager.output_received.connect(on_output);
         this.vpn_manager.error_received.connect(on_error);
+    }
+
+    private Widget create_info_indicator_widget() {
+        var info_icon = new DrawingArea();
+        info_icon.set_size_request(14, 14);
+        info_icon.draw.connect((cr) => {
+            Allocation alloc;
+            info_icon.get_allocation(out alloc);
+
+            double w = (double) alloc.width;
+            double h = (double) alloc.height;
+            double min_side = (w < h) ? w : h;
+            double radius = (min_side / 2.0) - 1.0;
+            double cx = w / 2.0;
+            double cy = h / 2.0;
+
+            // Blue info circle
+            cr.set_source_rgb(0.20, 0.47, 0.86);
+            cr.arc(cx, cy, radius, 0, 2 * Math.PI);
+            cr.fill();
+
+            // White "i" dot
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.arc(cx, cy - (radius * 0.35), radius * 0.12, 0, 2 * Math.PI);
+            cr.fill();
+
+            // White "i" stem
+            cr.set_line_width((radius * 0.24) > 1.0 ? (radius * 0.24) : 1.0);
+            cr.move_to(cx, cy - (radius * 0.05));
+            cr.line_to(cx, cy + (radius * 0.42));
+            cr.stroke();
+
+            return false;
+        });
+
+        return info_icon;
     }
 
     private void create_logs_dialog() {
@@ -474,6 +531,66 @@ class OpenVPNGui : ApplicationWindow {
         } else {
             this.config_label.set_text(this.vpn_manager.config_file);
         }
+
+        update_credential_source_label();
+    }
+
+    private string? read_auth_user_pass_path(string ovpn_path) {
+        try {
+            string contents;
+            if (!FileUtils.get_contents(ovpn_path, out contents)) {
+                return null;
+            }
+
+            foreach (string raw_line in contents.split("\n")) {
+                string line = raw_line.strip();
+                if (line == "" || line.has_prefix("#") || line.has_prefix(";")) {
+                    continue;
+                }
+
+                if (line == "auth-user-pass" || line.has_prefix("auth-user-pass ") || line.has_prefix("auth-user-pass\t")) {
+                    var tokens = line.split_set(" \t");
+                    string[] non_empty = {};
+                    foreach (string token in tokens) {
+                        if (token.strip() != "") {
+                            non_empty += token.strip();
+                        }
+                    }
+
+                    if (non_empty.length >= 2) {
+                        return non_empty[1];
+                    }
+
+                    return "";
+                }
+            }
+        } catch (Error e) {
+            return null;
+        }
+
+        return null;
+    }
+
+    private void update_credential_source_label() {
+        if (this.creds_status_label == null) {
+            return;
+        }
+
+        string status_message;
+        if (this.vpn_manager.config_file == "") {
+            status_message = "Credentials source: no config selected";
+        } else {
+            string? auth_source = read_auth_user_pass_path(this.vpn_manager.config_file);
+            if (auth_source == null) {
+                status_message = "Credentials source: auth-user-pass not found in config";
+            } else if (auth_source == "") {
+                status_message = "Credentials source: interactive prompt (auth-user-pass without file)";
+            } else {
+                status_message = "Credentials source: " + auth_source;
+            }
+        }
+
+        this.creds_status_label.set_text(status_message);
     }
 
     private string get_config_file_path() {
