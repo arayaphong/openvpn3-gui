@@ -898,9 +898,18 @@ class OpenVPNGui : ApplicationWindow {
 }
 
 class OpenVPNApplication : Gtk.Application {
+    private OpenVPNGui? main_window = null;
+
+    public OpenVPNApplication() {
+        Object(application_id: "com.arayaphong.openvpn3gui", flags: ApplicationFlags.FLAGS_NONE);
+    }
+
     protected override void activate() {
-        var window = new OpenVPNGui(this);
-        window.show();
+        if (this.main_window == null) {
+            this.main_window = new OpenVPNGui(this);
+        }
+
+        this.main_window.present();
     }
 }
 
