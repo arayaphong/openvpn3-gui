@@ -3,7 +3,10 @@ using GLib;
 
 class OpenVPNManager : Object {
     private Subprocess? process = null;
+    private bool force_kill_in_progress = false;
     public string config_file { get; set; default = ""; }
+    public string pid_file_path { get; set; default = ""; }
+    public bool use_sudo { get; set; default = false; }
     public bool connected { get; set; default = false; }
     
     public signal void output_received(string text);
@@ -25,7 +28,16 @@ class OpenVPNManager : Object {
         }
         
         try {
-            string[] cmd = { "pkexec", "openvpn", "--config", this.config_file };
+            string launcher = this.use_sudo ? "sudo" : "pkexec";
+            if (this.pid_file_path != "") {
+                FileUtils.remove(this.pid_file_path);
+            }
+            string[] cmd;
+            if (this.pid_file_path != "") {
+                cmd = { launcher, "openvpn", "--config", this.config_file, "--writepid", this.pid_file_path };
+            } else {
+                cmd = { launcher, "openvpn", "--config", this.config_file };
+            }
             this.process = new Subprocess.newv(
                 (owned) cmd,
                 SubprocessFlags.STDOUT_PIPE | SubprocessFlags.STDERR_PIPE
@@ -43,11 +55,38 @@ class OpenVPNManager : Object {
                 }
                 this.process = null;
                 this.connected = false;
+                if (this.pid_file_path != "") {
+                    FileUtils.remove(this.pid_file_path);
+                }
             });
         } catch (Error e) {
             error_received("Process error: " + e.message);
             this.process = null;
             this.connected = false;
+            if (this.pid_file_path != "") {
+                FileUtils.remove(this.pid_file_path);
+            }
+        }
+    }
+
+    private bool try_read_vpn_pid(out string pid_str) {
+        pid_str = "";
+        if (this.pid_file_path == "") {
+            return false;
+        }
+        try {
+            string contents;
+            if (!FileUtils.get_contents(this.pid_file_path, out contents)) {
+                return false;
+            }
+            string pid = contents.strip();
+            if (pid == "") {
+                return false;
+            }
+            pid_str = pid;
+            return true;
+        } catch (Error e) {
+            return false;
         }
     }
     
@@ -104,32 +143,51 @@ class OpenVPNManager : Object {
         // If we have a process we started, terminate it
         if (this.process != null) {
             this.process.send_signal(Posix.Signal.TERM);
-            this.process = null;
         } else {
-            // If no process in our manager, try to kill openvpn via system command
+            // If no tracked process, try PID-based kill first.
             try {
-                string stdout_str;
-                string stderr_str;
-                int exit_status;
-                Process.spawn_command_line_sync(
-                    "pkexec killall -9 openvpn",
-                    out stdout_str,
-                    out stderr_str,
-                    out exit_status
-                );
-                if (exit_status != 0 && exit_status != 1) {
-                    output_received("Warning: killall exit code " + exit_status.to_string() + "\n");
-                }
-                if (stderr_str != "") {
-                    output_received("Stderr: " + stderr_str + "\n");
+                if (!this.force_kill_in_progress) {
+                    this.force_kill_in_progress = true;
+                    string[] cmd;
+                    string pid_str;
+                    if (try_read_vpn_pid(out pid_str)) {
+                        if (this.use_sudo) {
+                            cmd = { "sudo", "-n", "kill", "-TERM", pid_str };
+                        } else {
+                            cmd = { "pkexec", "kill", "-TERM", pid_str };
+                        }
+                    } else {
+                        // Fallback for stale/missing pidfile.
+                        if (this.use_sudo) {
+                            cmd = { "sudo", "-n", "killall", "-9", "openvpn" };
+                        } else {
+                            cmd = { "pkexec", "killall", "-9", "openvpn" };
+                        }
+                    }
+                    var kill_proc = new Subprocess.newv(
+                        (owned) cmd,
+                        SubprocessFlags.STDOUT_SILENCE | SubprocessFlags.STDERR_PIPE
+                    );
+                    kill_proc.wait_async.begin(null, (obj, res) => {
+                        try {
+                            kill_proc.wait_async.end(res);
+                            if (kill_proc.get_exit_status() != 0 && kill_proc.get_exit_status() != 1) {
+                                output_received("Warning: kill command exit code " + kill_proc.get_exit_status().to_string() + "\n");
+                            }
+                        } catch (Error e) {
+                            output_received("Error waiting kill command: " + e.message + "\n");
+                        }
+                        this.force_kill_in_progress = false;
+                    });
                 }
             } catch (Error e) {
                 output_received("Error killing openvpn: " + e.message + "\n");
+                this.force_kill_in_progress = false;
             }
         }
         
         this.connected = false;
-        output_received("✓ VPN Disconnected\n");
+        output_received("Disconnect signal sent.\n");
     }
 }
 
@@ -141,17 +199,21 @@ class OpenVPNGui : ApplicationWindow {
     private Label config_label;
     private TextView text_view;
     private TextView history_view;
+    private int disconnect_verify_attempts = 0;
 
     public OpenVPNGui(Gtk.Application app) {
         Object(application: app);
 
         this.vpn_manager = new OpenVPNManager();
+        this.vpn_manager.pid_file_path = GLib.Path.build_filename(GLib.Environment.get_tmp_dir(), "openvpn-gui-" + GLib.Environment.get_user_name() + ".pid");
 
         this.set_title("OpenVPN GUI");
         this.set_default_size(600, 400);
         this.set_border_width(10);
 
         build_ui();
+
+        this.vpn_manager.use_sudo = has_auth_rule();
 
         // Auto-load .ovpn file from executable directory
         auto_load_config_file();
@@ -283,6 +345,66 @@ class OpenVPNGui : ApplicationWindow {
         this.vpn_manager.error_received.connect(on_error);
     }
 
+    private string get_sudoers_rule_path() {
+        return "/etc/sudoers.d/openvpn-gui-%s".printf(GLib.Environment.get_user_name());
+    }
+
+    private bool has_auth_rule() {
+        return File.new_for_path(get_sudoers_rule_path()).query_exists();
+    }
+
+    private string find_openvpn_path() {
+        string[] candidates = { "/usr/sbin/openvpn", "/sbin/openvpn", "/usr/bin/openvpn" };
+        try {
+            string out_str;
+            string err_str;
+            int exit_status;
+            Process.spawn_command_line_sync("which openvpn", out out_str, out err_str, out exit_status);
+            if (exit_status == 0 && out_str.strip() != "") {
+                return out_str.strip();
+            }
+        } catch (Error e) {
+            // Fallback to common paths below.
+        }
+        foreach (string p in candidates) {
+            if (File.new_for_path(p).query_exists()) {
+                return p;
+            }
+        }
+        return "/usr/sbin/openvpn";
+    }
+
+    private async bool install_auth_rule_async() {
+        var username = GLib.Environment.get_user_name();
+        var openvpn_path = find_openvpn_path();
+        var rule_content = "%s ALL=(ALL) NOPASSWD: %s, /bin/kill, /usr/bin/kill\n".printf(username, openvpn_path);
+        var temp_rule_path = GLib.Path.build_filename(GLib.Environment.get_tmp_dir(), "openvpn-gui-sudoers-" + username);
+        var rule_path = get_sudoers_rule_path();
+
+        try {
+            FileUtils.set_contents(temp_rule_path, rule_content);
+            Posix.chmod(temp_rule_path, 0600);
+
+            string[] cmd = { "pkexec", "install", "-m", "440", temp_rule_path, rule_path };
+            var proc = new Subprocess.newv((owned) cmd, SubprocessFlags.STDOUT_SILENCE | SubprocessFlags.STDERR_SILENCE);
+            yield proc.wait_async();
+
+            if (proc.get_exit_status() == 0) {
+                this.vpn_manager.use_sudo = true;
+                append_output("Authorization remembered automatically. Future connections should not require fingerprint.\n");
+                FileUtils.remove(temp_rule_path);
+                return true;
+            } else {
+                append_output("Could not save authorization rule.\n");
+            }
+        } catch (Error e) {
+            append_output("Could not save authorization rule: %s\n".printf(e.message));
+        }
+
+        FileUtils.remove(temp_rule_path);
+        return false;
+    }
+
     private string get_config_file_path() {
         var home = GLib.Environment.get_home_dir();
         var vpn_dir = GLib.Path.build_filename(home, ".vpn");
@@ -357,16 +479,15 @@ class OpenVPNGui : ApplicationWindow {
             string stderr_str;
             int exit_status;
 
-            // Check if tun devices exist using sh -c for proper shell parsing
+            // Check if openvpn process is actually running
             Process.spawn_command_line_sync(
-                "sh -c \"ip link show | grep tun\"",
+                "pgrep -x openvpn",
                 out stdout_str,
                 out stderr_str,
                 out exit_status
             );
 
-            if (exit_status == 0 && stdout_str != "") {
-                // VPN is connected
+            if (exit_status == 0 && stdout_str.strip() != "") {
                 this.status_label.set_label("Status: Connected (detected on startup)");
                 this.disconnect_btn.set_sensitive(true);
                 this.connect_btn.set_sensitive(false);
@@ -451,11 +572,35 @@ class OpenVPNGui : ApplicationWindow {
         append_output("\n=== Connecting to VPN ===\n");
         append_history("Attempting connection...");
 
+        // First connection setup: ask once to install sudoers rule, then connect via sudo.
+        if (!this.vpn_manager.use_sudo && !has_auth_rule()) {
+            append_output("Setting up authorization memory...\n");
+            install_auth_rule_async.begin((obj, res) => {
+                bool installed = false;
+                try {
+                    installed = install_auth_rule_async.end(res);
+                } catch (Error e) {
+                    append_output("Authorization setup failed: %s\n".printf(e.message));
+                }
+
+                if (!installed) {
+                    this.status_label.set_label("Status: Authorization Setup Failed");
+                    this.connect_btn.set_sensitive(true);
+                    return;
+                }
+
+                append_output("Authorization ready. Starting VPN...\n");
+                this.vpn_manager.connect();
+            });
+            return;
+        }
+
         this.vpn_manager.connect();
     }
 
     private void on_disconnect() {
         this.disconnect_btn.set_sensitive(false);
+        this.disconnect_verify_attempts = 0;
         this.vpn_manager.disconnect();
         
         // Give the system a moment to process the kill command
@@ -471,25 +616,39 @@ class OpenVPNGui : ApplicationWindow {
             string stderr_str;
             int exit_status;
             
-            // Check if tun devices still exist
+            // Check if openvpn process is still running
             Process.spawn_command_line_sync(
-                "sh -c \"ip link show | grep tun\"",
+                "pgrep -x openvpn",
                 out stdout_str,
                 out stderr_str,
                 out exit_status
             );
             
-            // If no tun devices found (exit_status != 0), VPN is really disconnected
-            if (exit_status != 0 || stdout_str == "") {
+            if (exit_status != 0 || stdout_str.strip() == "") {
                 this.status_label.set_label("Status: Disconnected");
                 if (this.vpn_manager.config_file != "") {
                     this.connect_btn.set_sensitive(true);
                 }
                 append_history("Disconnected");
+                append_output("✓ VPN Disconnected\n");
             } else {
                 // Still connected, try killing again
                 append_output("VPN still running, attempting force kill...\n");
                 this.vpn_manager.disconnect();
+
+                this.disconnect_verify_attempts++;
+                if (this.disconnect_verify_attempts < 10) {
+                    Timeout.add(500, () => {
+                        verify_disconnection();
+                        return false;
+                    });
+                } else {
+                    append_output("Disconnect is taking longer than expected.\n");
+                    this.status_label.set_label("Status: Disconnecting...");
+                    if (this.vpn_manager.config_file != "") {
+                        this.connect_btn.set_sensitive(true);
+                    }
+                }
             }
         } catch (Error e) {
             append_output("Verification error: " + e.message + "\n");
