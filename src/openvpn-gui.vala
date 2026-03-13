@@ -355,15 +355,6 @@ class OpenVPNGui : ApplicationWindow {
         content.set_margin_end(8);
         content.set_spacing(8);
 
-        var logs_toolbar = new Box(Orientation.HORIZONTAL, 8);
-        logs_toolbar.set_margin_bottom(2);
-        var refresh_sessions_btn = new Button.with_label("Fetch Network Status");
-        refresh_sessions_btn.set_image(new Image.from_icon_name("view-refresh-symbolic", IconSize.BUTTON));
-        refresh_sessions_btn.set_always_show_image(true);
-        refresh_sessions_btn.clicked.connect(on_refresh_sessions);
-        logs_toolbar.pack_start(refresh_sessions_btn, false, false, 0);
-        content.pack_start(logs_toolbar, false, false, 0);
-
         var notebook = new Notebook();
         notebook.set_margin_top(2);
 
@@ -829,71 +820,6 @@ class OpenVPNGui : ApplicationWindow {
         }
 
         file_chooser.destroy();
-    }
-
-    private void on_refresh_sessions() {
-        try {
-            string stdout_str;
-            string stderr_str;
-            int exit_status;
-
-            // Check VPN connection status using ip link
-            Process.spawn_command_line_sync(
-                "ip link show",
-                out stdout_str,
-                out stderr_str,
-                out exit_status
-            );
-
-            // Clear history and show status
-            var buffer = this.history_view.get_buffer();
-            buffer.set_text("", -1);
-
-            if (exit_status == 0) {
-                // Parse output to find active tun devices
-                var lines = stdout_str.split("\n");
-                append_to_history_direct("=== Network Interfaces ===");
-
-                foreach (string line in lines) {
-                    if (line.contains("tun") || line.contains("UP")) {
-                        append_to_history_direct(line);
-                    }
-                }
-
-                // Check VPN routes
-                Process.spawn_command_line_sync(
-                    "sh -c \"ip route | grep tun\"",
-                    out stdout_str,
-                    out stderr_str,
-                    out exit_status
-                );
-
-                append_to_history_direct("\n=== VPN Routes ===");
-                if (exit_status == 0 && stdout_str != "") {
-                    var route_lines = stdout_str.split("\n");
-                    foreach (string line in route_lines) {
-                        if (line.strip() != "") {
-                            append_to_history_direct(line);
-                        }
-                    }
-                } else {
-                    append_to_history_direct("No active VPN routes found.");
-                }
-            }
-
-            append_output("Connection status refreshed.\n");
-        } catch (Error e) {
-            append_output("Error checking connection status: " + e.message + "\n");
-            append_to_history_direct("Error: " + e.message);
-        }
-    }
-
-    private void append_to_history_direct(string text) {
-        var buffer = this.history_view.get_buffer();
-        TextIter end_iter;
-        buffer.get_end_iter(out end_iter);
-        buffer.insert(ref end_iter, text + "\n", -1);
-        scroll_to_bottom(this.history_view);
     }
 }
 
