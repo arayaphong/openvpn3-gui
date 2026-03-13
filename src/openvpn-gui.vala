@@ -138,6 +138,8 @@ class OpenVPNManager : Object {
     
     
     public new void disconnect() {
+        // Mark disconnected before emitting output so UI handlers do not re-enable buttons.
+        this.connected = false;
         output_received("Disconnecting VPN...\n");
         
         // If we have a process we started, terminate it
@@ -186,7 +188,6 @@ class OpenVPNManager : Object {
             }
         }
         
-        this.connected = false;
         output_received("Disconnect signal sent.\n");
     }
 }
@@ -221,17 +222,12 @@ class OpenVPNGui : ApplicationWindow {
         // Check initial VPN connection status and update buttons
         check_and_update_connection_status();
 
-        this.delete_event.connect(() => {
-            if (this.vpn_manager.connected) {
-                this.vpn_manager.disconnect();
-            }
-            return false;
-        });
     }
 
     private void build_ui() {
-        // Main horizontal container for left and right panels
-        var main_hbox = new Box(Orientation.HORIZONTAL, 10);
+        // Main split container for left and right panels
+        var main_paned = new Paned(Orientation.HORIZONTAL);
+        main_paned.set_margin_end(10);
 
         // Left panel (main controls)
         var vbox = new Box(Orientation.VERTICAL, 10);
@@ -293,7 +289,7 @@ class OpenVPNGui : ApplicationWindow {
 
         this.text_view = new TextView();
         this.text_view.set_editable(false);
-        this.text_view.set_wrap_mode(WrapMode.WORD_CHAR);
+        this.text_view.set_wrap_mode(WrapMode.NONE);
         this.text_view.set_monospace(true);
 
         var buffer = this.text_view.get_buffer();
@@ -302,12 +298,13 @@ class OpenVPNGui : ApplicationWindow {
         scrolled.add(this.text_view);
         vbox.pack_start(scrolled, true, true, 0);
 
-        main_hbox.pack_start(vbox, true, true, 0);
+        main_paned.pack1(vbox, true, false);
 
         // Right panel (connection history)
         var right_vbox = new Box(Orientation.VERTICAL, 5);
         right_vbox.set_margin_top(10);
         right_vbox.set_margin_bottom(10);
+        right_vbox.set_margin_start(10);
         right_vbox.set_margin_end(10);
 
         var history_header = new Label(null);
@@ -326,7 +323,7 @@ class OpenVPNGui : ApplicationWindow {
 
         this.history_view = new TextView();
         this.history_view.set_editable(false);
-        this.history_view.set_wrap_mode(WrapMode.WORD_CHAR);
+        this.history_view.set_wrap_mode(WrapMode.NONE);
         this.history_view.set_monospace(true);
 
         var history_buffer = this.history_view.get_buffer();
@@ -335,10 +332,31 @@ class OpenVPNGui : ApplicationWindow {
         history_scrolled.add(this.history_view);
         right_vbox.pack_start(history_scrolled, true, true, 0);
 
-        main_hbox.pack_start(right_vbox, false, false, 0);
+        main_paned.pack2(right_vbox, false, false);
 
-        this.add(main_hbox);
+        this.add(main_paned);
         this.show_all();
+
+        Idle.add(() => {
+            int width = this.get_allocated_width();
+            if (width > 0) {
+                main_paned.set_position(width / 2);
+            }
+            return false;
+        });
+
+        this.window_state_event.connect((event) => {
+            if ((event.changed_mask & Gdk.WindowState.MAXIMIZED) != 0) {
+                Idle.add(() => {
+                    int width = this.get_allocated_width();
+                    if (width > 0) {
+                        main_paned.set_position(width / 2);
+                    }
+                    return false;
+                });
+            }
+            return false;
+        });
 
         // Connect signals
         this.vpn_manager.output_received.connect(on_output);
@@ -473,34 +491,113 @@ class OpenVPNGui : ApplicationWindow {
         }
     }
 
-    private void check_and_update_connection_status() {
+    private bool is_openvpn_pid(string pid_str) {
+        try {
+            int pid = int.parse(pid_str);
+            if (pid <= 1) {
+                return false;
+            }
+        } catch (Error e) {
+            return false;
+        }
+
+        var proc_path = "/proc/%s".printf(pid_str);
+        if (!File.new_for_path(proc_path).query_exists()) {
+            return false;
+        }
+
+        // Verify process name to avoid false positives from stale/reused PID values.
+        try {
+            string comm_contents;
+            if (FileUtils.get_contents("/proc/%s/comm".printf(pid_str), out comm_contents)) {
+                if (comm_contents.strip() == "openvpn") {
+                    return true;
+                }
+            }
+        } catch (Error e) {
+            // Ignore and try cmdline fallback.
+        }
+
+        try {
+            string cmdline_contents;
+            if (FileUtils.get_contents("/proc/%s/cmdline".printf(pid_str), out cmdline_contents)) {
+                if (cmdline_contents.contains("openvpn")) {
+                    return true;
+                }
+            }
+        } catch (Error e) {
+            // If both probes fail, assume this is not openvpn.
+        }
+
+        return false;
+    }
+
+    private bool detect_active_vpn_on_startup() {
+        // Try pidfile first because openvpn may run under elevated privileges.
+        if (this.vpn_manager.pid_file_path != "") {
+            try {
+                string pid_contents;
+                if (FileUtils.get_contents(this.vpn_manager.pid_file_path, out pid_contents)) {
+                    string pid_str = pid_contents.strip();
+                    if (is_openvpn_pid(pid_str)) {
+                        return true;
+                    }
+
+                    // Remove stale pidfile so future startups do not report false state.
+                    FileUtils.remove(this.vpn_manager.pid_file_path);
+                }
+            } catch (Error e) {
+                // Ignore and continue with other probes.
+            }
+        }
+
         try {
             string stdout_str;
             string stderr_str;
             int exit_status;
 
-            // Check if openvpn process is actually running
             Process.spawn_command_line_sync(
                 "pgrep -x openvpn",
                 out stdout_str,
                 out stderr_str,
                 out exit_status
             );
-
             if (exit_status == 0 && stdout_str.strip() != "") {
-                this.status_label.set_label("Status: Connected (detected on startup)");
-                this.disconnect_btn.set_sensitive(true);
-                this.connect_btn.set_sensitive(false);
-                append_output("Detected active VPN connection on startup.\n");
-            } else {
-                // VPN is not connected - enable connect button if config is loaded
-                if (this.vpn_manager.config_file != "") {
-                    this.connect_btn.set_sensitive(true);
-                }
-                this.disconnect_btn.set_sensitive(false);
+                return true;
+            }
+
+            // Fallback: consider VPN active only if tun routes exist and are not marked linkdown.
+            Process.spawn_command_line_sync(
+                "sh -c \"ip route | grep -E ' dev tun[0-9]+' | grep -v linkdown\"",
+                out stdout_str,
+                out stderr_str,
+                out exit_status
+            );
+            if (exit_status == 0 && stdout_str.strip() != "") {
+                return true;
             }
         } catch (Error e) {
-            append_output("Error checking connection status: " + e.message + "\n");
+            // Treat probe failures as disconnected.
+        }
+
+        return false;
+    }
+
+    private void check_and_update_connection_status() {
+        if (detect_active_vpn_on_startup()) {
+            this.vpn_manager.connected = true;
+            this.status_label.set_label("Status: Connected");
+            this.disconnect_btn.set_sensitive(true);
+            this.connect_btn.set_sensitive(false);
+            append_output("Detected active VPN connection on startup.\n");
+        } else {
+            this.vpn_manager.connected = false;
+
+            // VPN is not connected - enable connect button if config is loaded
+            if (this.vpn_manager.config_file != "") {
+                this.connect_btn.set_sensitive(true);
+            }
+            this.disconnect_btn.set_sensitive(false);
         }
     }
 
@@ -625,7 +722,9 @@ class OpenVPNGui : ApplicationWindow {
             );
             
             if (exit_status != 0 || stdout_str.strip() == "") {
+                this.vpn_manager.connected = false;
                 this.status_label.set_label("Status: Disconnected");
+                this.disconnect_btn.set_sensitive(false);
                 if (this.vpn_manager.config_file != "") {
                     this.connect_btn.set_sensitive(true);
                 }
